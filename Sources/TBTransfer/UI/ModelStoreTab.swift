@@ -470,13 +470,19 @@ struct ModelStoreTab: View {
         return out
     }
 
+    /// A directory is a usable model only if it holds at least one REAL weight
+    /// file — a `*.safetensors` or `*.gguf` that actually resolves. A lone
+    /// `config.json`, or a broken blob symlink left behind after dedup / an
+    /// HF `--local-dir` download, does NOT count — so metadata-only cache
+    /// shells (which would fail to transfer) are filtered out. `fileExists`
+    /// follows symlinks, so a working symlinked weight still qualifies.
     nonisolated private static func looksLikeModel(_ dir: URL) -> Bool {
         let fm = FileManager.default
         guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return false }
-        for n in names {
-            if n == "config.json" { return true }
-            if n.hasSuffix(".safetensors") || n.hasSuffix(".safetensors.index.json") { return true }
-            if n.hasSuffix(".gguf") { return true }
+        // Weight formats: safetensors (MLX/HF), gguf (llama.cpp), npz (older MLX,
+        // e.g. whisper). config.json/index alone never qualify.
+        for n in names where n.hasSuffix(".safetensors") || n.hasSuffix(".gguf") || n.hasSuffix(".npz") {
+            if fm.fileExists(atPath: dir.appendingPathComponent(n).path) { return true }
         }
         return false
     }
