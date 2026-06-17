@@ -141,7 +141,6 @@ struct ModelStoreTab: View {
         .sheet(isPresented: $showProgress) {
             ModelSendProgressSheet(
                 taskIDs: inFlightTaskIDs,
-                peerName: peer?.displayName ?? "peer",
                 destRelativePath: destStore.relativePath
             ) { showProgress = false }
                 .environment(app)
@@ -279,11 +278,22 @@ struct ModelStoreTab: View {
                 .help("Where on the peer the models land (~/\(destStore.relativePath))")
             }
 
+            // Fan-out: push the selected models to EVERY online node's store at
+            // once, so any node can load them locally (no per-node WiFi staging).
+            Button {
+                syncToAll()
+            } label: {
+                Label(syncAllLabel, systemImage: "square.stack.3d.up.fill")
+            }
+            .buttonStyle(.bordered)
+            .disabled(!canSyncAll)
+            .help("Push the selected models to EVERY online node's \(destStore.shortLabel) store over Thunderbolt — so any node loads them instantly, no staging.")
+
             Button {
                 send()
             } label: {
                 Label(sendLabel, systemImage: "paperplane.fill")
-                    .frame(minWidth: 150)
+                    .frame(minWidth: 110)
             }
             .buttonStyle(.borderedProminent)
             .keyboardShortcut(.return, modifiers: [.command])
@@ -304,6 +314,14 @@ struct ModelStoreTab: View {
     private var canSend: Bool {
         guard let peer, peer.isOnline, !selection.isEmpty else { return false }
         return true
+    }
+
+    /// Every reachable peer — the targets for a fan-out sync.
+    private var onlinePeers: [Peer] { app.peerStore.peers.filter(\.isOnline) }
+    private var canSyncAll: Bool { !selection.isEmpty && !onlinePeers.isEmpty }
+    private var syncAllLabel: String {
+        let m = onlinePeers.count
+        return "Sync All · \(m) node\(m == 1 ? "" : "s")"
     }
 
     // MARK: - Actions
@@ -368,6 +386,33 @@ struct ModelStoreTab: View {
         let route = dst == src ? dst.shortLabel : "\(src.shortLabel)→\(dst.shortLabel)"
         app.statusLine = "Queued \(n) model\(n == 1 ? "" : "s") → \(peer.displayName):~/\(dst.relativePath) [\(route)]"
         // Show the live progress sheet (mirrors the Send tab) and clear selection.
+        inFlightTaskIDs = ids
+        showProgress = true
+        selection = []
+    }
+
+    /// Fan-out: push each selected model to the matching store on EVERY online
+    /// peer (one task per model per node). This is the "make it fast everywhere"
+    /// action — once every node holds the complete model in its store, any
+    /// single-/multi-node launch loads it locally with zero staging. Same
+    /// layout-aware packager as `send()`; the engine serializes the tasks so the
+    /// progress sheet fills node-by-node.
+    private func syncToAll() {
+        guard !selection.isEmpty, !onlinePeers.isEmpty else { return }
+        let dst = destStore
+        var ids: [UUID] = []
+        for identity in selection.sorted() {
+            guard let entry = models.first(where: { $0.identity == identity }) else { continue }
+            let destPath = "~/\(dst.relativePath)/\(dst.subpath(for: identity))"
+            for p in onlinePeers {
+                let task = TransferTask(
+                    peerID: p.id, direction: .push, sources: [entry.path], destination: destPath
+                )
+                app.transferEngine.enqueue(task, peer: p)
+                ids.append(task.id)
+            }
+        }
+        app.statusLine = "Syncing \(selection.count) model\(selection.count == 1 ? "" : "s") → \(onlinePeers.count) node\(onlinePeers.count == 1 ? "" : "s") (~/\(dst.relativePath))"
         inFlightTaskIDs = ids
         showProgress = true
         selection = []
@@ -556,7 +601,6 @@ private struct ModelRow: View {
 private struct ModelSendProgressSheet: View {
     @Environment(AppState.self) private var app
     let taskIDs: [UUID]
-    let peerName: String
     let destRelativePath: String
     let onClose: () -> Void
 
@@ -567,6 +611,16 @@ private struct ModelSendProgressSheet: View {
     }
 
     private var tasks: [TransferTask] { taskIDs.compactMap(task) }
+
+    /// Distinct target nodes — drives whether this is a single Send or a Sync-All.
+    private var peerIDs: [UUID] { Array(Set(tasks.map(\.peerID))) }
+    private var modelCount: Int { Set(tasks.map { $0.sources.first ?? "" }).count }
+    /// "Studio" for a single peer, "3 nodes" for a fan-out.
+    private var targetLabel: String {
+        if peerIDs.count == 1, let p = app.peerStore.peer(id: peerIDs[0]) { return p.displayName }
+        return "\(peerIDs.count) node\(peerIDs.count == 1 ? "" : "s")"
+    }
+    private func nodeName(_ id: UUID) -> String { app.peerStore.peer(id: id)?.displayName ?? "peer" }
 
     private var overallFraction: Double {
         let total = tasks.reduce(Int64(0)) { $0 + max($1.totalBytes, $1.bytesTransferred) }
@@ -608,7 +662,7 @@ private struct ModelSendProgressSheet: View {
             ScrollView {
                 VStack(spacing: 10) {
                     ForEach(tasks) { t in
-                        TaskProgressRow(task: t)
+                        TaskProgressRow(task: t, nodeName: nodeName(t.peerID))
                     }
                 }
                 .padding(.vertical, 2)
@@ -627,9 +681,9 @@ private struct ModelSendProgressSheet: View {
                 .font(.title)
                 .foregroundStyle(headerTint)
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(taskIDs.count) model\(taskIDs.count == 1 ? "" : "s") → \(peerName)")
+                Text("\(modelCount) model\(modelCount == 1 ? "" : "s") → \(targetLabel)")
                     .font(.headline)
-                Text("~/\(destRelativePath)")
+                Text("~/\(destRelativePath)\(peerIDs.count > 1 ? " · \(taskIDs.count) transfers" : "")")
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
             }
@@ -658,12 +712,14 @@ private struct ModelSendProgressSheet: View {
 /// One model's progress row inside the send sheet.
 private struct TaskProgressRow: View {
     let task: TransferTask
+    let nodeName: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 Image(systemName: icon).foregroundStyle(color)
                 Text(filename).font(.callout).lineLimit(1).truncationMode(.middle)
+                Text("→ \(nodeName)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 Spacer()
                 Text(task.status.rawValue.capitalized)
                     .font(.caption2.weight(.semibold))
