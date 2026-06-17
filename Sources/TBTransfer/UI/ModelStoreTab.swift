@@ -407,10 +407,20 @@ struct ModelStoreTab: View {
 
     nonisolated private static func subdirectories(of url: URL) -> [URL] {
         let fm = FileManager.default
-        guard let kids = try? fm.contentsOfDirectory(
-            at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
-        ) else { return [] }
-        return kids.filter { ((try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false) }
+        guard let names = try? fm.contentsOfDirectory(atPath: url.path) else { return [] }
+        var out: [URL] = []
+        for name in names where !name.hasPrefix(".") {
+            let child = url.appendingPathComponent(name)
+            var isDir: ObjCBool = false
+            // fileExists FOLLOWS symlinks (unlike URL's .isDirectoryKey, which
+            // reports the link itself as a non-directory). Many of Ray's models
+            // are symlinks — LM Studio entries point into EXO / the HF cache —
+            // so without this they'd be invisible to the scanner.
+            if fm.fileExists(atPath: child.path, isDirectory: &isDir), isDir.boolValue {
+                out.append(child)
+            }
+        }
+        return out
     }
 
     nonisolated private static func looksLikeModel(_ dir: URL) -> Bool {
@@ -424,10 +434,13 @@ struct ModelStoreTab: View {
         return false
     }
 
-    /// Directory size in KB via `du -sk` (fast; far quicker than walking the
-    /// tree in Foundation for a 40-70 GB model dir).
+    /// Directory size in KB via `du -skL` (fast; far quicker than walking the
+    /// tree in Foundation for a 40-70 GB model dir). `-L` dereferences symlinks
+    /// so a symlinked model (e.g. an LM Studio entry pointing into the HF cache)
+    /// reports its real size, not the ~0-byte link — matching what rsync's `-L`
+    /// will actually transfer.
     nonisolated private static func dirSizeKB(_ path: String) async -> Int64 {
-        guard let result = try? await ShellRunner.run("/usr/bin/du", ["-sk", path], timeout: 30),
+        guard let result = try? await ShellRunner.run("/usr/bin/du", ["-skL", path], timeout: 30),
               result.ok,
               let field = result.stdout.split(whereSeparator: \.isWhitespace).first,
               let kb = Int64(field) else { return 0 }
