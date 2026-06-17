@@ -16,44 +16,56 @@ import AppKit
 /// DESTINATION store's shape (flat ⇄ nested) — so an EXO copy lands correctly
 /// in LM Studio and vice-versa.
 enum ModelStore: String, CaseIterable, Identifiable {
-    case exo, mtplx, lmstudio
+    case exo, mtplx, lmstudio, huggingface
     var id: Self { self }
 
     /// On-disk layout of a model identity ("org/model") for this store:
-    /// - `flat`:   one dir `org--model/` with the weight files inside (EXO, MTPLX).
-    /// - `nested`: two dirs `org/model/` (LM Studio's `publisher/repo/` tree).
-    enum Layout { case flat, nested }
+    /// - `flat`:        one dir `org--model/` with the weight files inside (EXO, MTPLX).
+    /// - `nested`:      two dirs `org/model/` (LM Studio's `publisher/repo/` tree).
+    /// - `huggingface`: the HF hub cache — `models--org--model/snapshots/<hash>/`,
+    ///   files symlinked into `blobs/`. Read-only (see `canBeDestination`).
+    enum Layout { case flat, nested, huggingface }
 
     var layout: Layout {
         switch self {
         case .exo, .mtplx: .flat
         case .lmstudio:    .nested
+        case .huggingface: .huggingface
         }
     }
 
-    /// `~/`-relative store root, used as the remote rsync destination base (the
-    /// `~` expands against the peer's `$HOME` at transfer time).
+    /// HF's hub cache is a content-addressed download cache (snapshots + blobs +
+    /// refs) that `huggingface_hub` owns — you fan models OUT of it into
+    /// runtimes, you don't hand-assemble repos INTO it. So it's offered as a
+    /// source to survey/send-from, but never as a transfer destination.
+    var canBeDestination: Bool { self != .huggingface }
+
+    /// `~/`-relative store root. For destinations this is the remote rsync base
+    /// (the `~` expands against the peer's `$HOME` at transfer time).
     var relativePath: String {
         switch self {
-        case .exo:      ".exo/models"
-        case .mtplx:    ".mtplx/models"
-        case .lmstudio: ".lmstudio/models"
+        case .exo:         ".exo/models"
+        case .mtplx:       ".mtplx/models"
+        case .lmstudio:    ".lmstudio/models"
+        case .huggingface: ".cache/huggingface/hub"
         }
     }
 
     var label: String {
         switch self {
-        case .exo:      "EXO  (.exo/models)"
-        case .mtplx:    "MTPLX  (.mtplx/models)"
-        case .lmstudio: "LM Studio  (.lmstudio/models)"
+        case .exo:         "EXO  (.exo/models)"
+        case .mtplx:       "MTPLX  (.mtplx/models)"
+        case .lmstudio:    "LM Studio  (.lmstudio/models)"
+        case .huggingface: "Hugging Face  (.cache/huggingface/hub)"
         }
     }
 
     var shortLabel: String {
         switch self {
-        case .exo:      "EXO"
-        case .mtplx:    "MTPLX"
-        case .lmstudio: "LM Studio"
+        case .exo:         "EXO"
+        case .mtplx:       "MTPLX"
+        case .lmstudio:    "LM Studio"
+        case .huggingface: "HF"
         }
     }
 
@@ -67,10 +79,12 @@ enum ModelStore: String, CaseIterable, Identifiable {
     /// parser's identity extraction, so flat→nested and nested→flat round-trip.
     /// The transfer engine's push pre-flight `mkdir -p`s this full path, so the
     /// nested `org/model` directory pair is created remotely before files copy.
+    /// (Only ever called for destinations, so `.huggingface` is unreachable; it
+    /// falls back to flat to keep the switch total.)
     func subpath(for identity: String) -> String {
         switch layout {
-        case .flat:   identity.replacingOccurrences(of: "/", with: "--")
-        case .nested: identity
+        case .flat, .huggingface: identity.replacingOccurrences(of: "/", with: "--")
+        case .nested:             identity
         }
     }
 }
@@ -133,12 +147,13 @@ struct ModelStoreTab: View {
                 .environment(app)
         }
         .onAppear {
-            // Default the destination to mirror the source the first time in.
-            destStore = sourceStore
+            // Default the destination to mirror the source — except a read-only
+            // source (HF cache) can't be a destination, so fall back to EXO.
+            destStore = sourceStore.canBeDestination ? sourceStore : .exo
             scan()
         }
         .onChange(of: sourceStore) { _, _ in
-            destStore = sourceStore
+            destStore = sourceStore.canBeDestination ? sourceStore : .exo
             scan()
         }
     }
@@ -254,7 +269,8 @@ struct ModelStoreTab: View {
             HStack(spacing: 6) {
                 Text("→").foregroundStyle(.secondary)
                 Picker("Destination store", selection: $destStore) {
-                    ForEach(ModelStore.allCases) { store in
+                    // HF cache is source-only — never a destination.
+                    ForEach(ModelStore.allCases.filter(\.canBeDestination)) { store in
                         Text(store.shortLabel).tag(store)
                     }
                 }
@@ -392,9 +408,40 @@ struct ModelStoreTab: View {
                                               path: repo.path))
                     }
                 }
+            case .huggingface:
+                // HF hub cache: each `models--org--model/` repo has its weights
+                // under `snapshots/<commit>/` (files symlinked into `blobs/`).
+                // Identity = org/model (strip the `models--` prefix, then the
+                // usual first-`--`→`/`). datasets--/spaces-- repos are skipped.
+                for repo in subdirectories(of: storeURL) {
+                    let name = repo.lastPathComponent
+                    guard name.hasPrefix("models--") else { continue }
+                    guard let snapshot = huggingfaceSnapshot(in: repo),
+                          looksLikeModel(snapshot) else { continue }
+                    let flat = String(name.dropFirst("models--".count))
+                    out.append(ModelEntry(identity: identity(fromFlatName: flat), path: snapshot.path))
+                }
             }
             return out.sorted { $0.identity.localizedCaseInsensitiveCompare($1.identity) == .orderedAscending }
         }.value
+    }
+
+    /// Resolve the active snapshot directory of an HF cache repo (`models--…`).
+    /// Prefers the commit `refs/main` points at; falls back to the
+    /// most-recently-modified snapshot. nil if the repo has no usable snapshot.
+    nonisolated private static func huggingfaceSnapshot(in repo: URL) -> URL? {
+        let fm = FileManager.default
+        let snaps = repo.appendingPathComponent("snapshots")
+        if let raw = try? String(contentsOf: repo.appendingPathComponent("refs/main"), encoding: .utf8) {
+            let hash = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            let candidate = snaps.appendingPathComponent(hash)
+            if !hash.isEmpty, fm.fileExists(atPath: candidate.path) { return candidate }
+        }
+        return subdirectories(of: snaps).max { a, b in
+            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            return da < db
+        }
     }
 
     /// `org--model` → `org/model`. Splits on the FIRST `--` only: HF org names
