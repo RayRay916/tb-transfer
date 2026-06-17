@@ -40,15 +40,24 @@ struct MainWindow: View {
 
     var body: some View {
         @Bindable var bindable = app
-        NavigationSplitView {
-            sidebar
-                .navigationSplitViewColumnWidth(min: 220, ideal: 260)
-        } detail: {
-            detailContent
+        // Status bar lives as a real VStack sibling BELOW the split view (not a
+        // .safeAreaInset on the NavigationSplitView) — the inset version did not
+        // reserve space in the detail column, so a full-width bottom bar in the
+        // detail (e.g. the Models tab's Send bar) rendered UNDER the status bar
+        // and clipped. As a sibling, the status bar reserves its height and the
+        // detail content always stays above it.
+        VStack(spacing: 0) {
+            NavigationSplitView {
+                sidebar
+                    .navigationSplitViewColumnWidth(min: 220, ideal: 260)
+            } detail: {
+                detailContent
+            }
+            .navigationTitle("TBTransfer")
+            .toolbar { toolbarItems }
+            Divider()
+            statusBar
         }
-        .navigationTitle("TBTransfer")
-        .toolbar { toolbarItems }
-        .safeAreaInset(edge: .bottom) { statusBar }
         .onReceive(NotificationCenter.default.publisher(for: .tbtPairPeer)) { note in
             if let peerID = note.object as? UUID, let peer = app.peerStore.peer(id: peerID) {
                 peerToPair = peer
