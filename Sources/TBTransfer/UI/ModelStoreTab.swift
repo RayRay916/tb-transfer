@@ -6,58 +6,90 @@ import AppKit
 /// The local AI model stores TBTransfer knows how to survey and sync. Each maps
 /// to a `~/`-relative directory that exists on every node of Ray's cluster.
 /// `.exo` is the canonical weight store (and what Skulk's SKULK_MODELS_PATH +
-/// `tbcluster.py --home skulk` target); `.mtplx` / `.mlxstudio` are alternate
+/// `tbcluster.py --home skulk` target); `.mtplx` / `.lmstudio` are alternate
 /// runtime stores you can push INTO for robustness (e.g. seed an MTPLX or LM
 /// Studio box from an EXO copy without re-downloading from HF).
+///
+/// Stores differ in how they lay a model identity (`org/model`) onto disk, so
+/// surveying + sending are **layout-aware**: the parser reads the identity out
+/// of whatever shape the SOURCE store uses, and the packager rebuilds it in the
+/// DESTINATION store's shape (flat ⇄ nested) — so an EXO copy lands correctly
+/// in LM Studio and vice-versa.
 enum ModelStore: String, CaseIterable, Identifiable {
-    case exo, mtplx, mlxstudio
+    case exo, mtplx, lmstudio
     var id: Self { self }
 
-    /// `~/`-relative path, used as the remote rsync destination (the `~`
-    /// expands against the peer's `$HOME` at transfer time).
+    /// On-disk layout of a model identity ("org/model") for this store:
+    /// - `flat`:   one dir `org--model/` with the weight files inside (EXO, MTPLX).
+    /// - `nested`: two dirs `org/model/` (LM Studio's `publisher/repo/` tree).
+    enum Layout { case flat, nested }
+
+    var layout: Layout {
+        switch self {
+        case .exo, .mtplx: .flat
+        case .lmstudio:    .nested
+        }
+    }
+
+    /// `~/`-relative store root, used as the remote rsync destination base (the
+    /// `~` expands against the peer's `$HOME` at transfer time).
     var relativePath: String {
         switch self {
-        case .exo:       ".exo/models"
-        case .mtplx:     ".mtplx/models"
-        case .mlxstudio: ".mlxstudio/models"
+        case .exo:      ".exo/models"
+        case .mtplx:    ".mtplx/models"
+        case .lmstudio: ".lmstudio/models"
         }
     }
 
     var label: String {
         switch self {
-        case .exo:       "EXO  (.exo/models)"
-        case .mtplx:     "MTPLX  (.mtplx/models)"
-        case .mlxstudio: "LM Studio  (.mlxstudio/models)"
+        case .exo:      "EXO  (.exo/models)"
+        case .mtplx:    "MTPLX  (.mtplx/models)"
+        case .lmstudio: "LM Studio  (.lmstudio/models)"
         }
     }
 
     var shortLabel: String {
         switch self {
-        case .exo:       "EXO"
-        case .mtplx:     "MTPLX"
-        case .mlxstudio: "LM Studio"
+        case .exo:      "EXO"
+        case .mtplx:    "MTPLX"
+        case .lmstudio: "LM Studio"
         }
     }
 
-    /// Absolute local directory on THIS Mac.
+    /// Absolute local store root on THIS Mac.
     var localURL: URL {
         URL(fileURLWithPath: Peer.expandTildePath("~/\(relativePath)"))
     }
+
+    /// **Packager.** Store-relative subpath where a model identity ("org/model")
+    /// must land so it conforms to THIS store's on-disk shape. Inverse of the
+    /// parser's identity extraction, so flat→nested and nested→flat round-trip.
+    /// The transfer engine's push pre-flight `mkdir -p`s this full path, so the
+    /// nested `org/model` directory pair is created remotely before files copy.
+    func subpath(for identity: String) -> String {
+        switch layout {
+        case .flat:   identity.replacingOccurrences(of: "/", with: "--")
+        case .nested: identity
+        }
+    }
 }
 
-/// One model directory discovered in a local store.
+/// One model discovered in a local store, normalized to its canonical identity.
 private struct ModelEntry: Identifiable, Hashable {
-    let name: String      // directory name, e.g. "m5max--Huihui-...-oQ8-mtp"
-    let path: String      // absolute local path
-    var id: String { name }
+    let identity: String  // canonical "org/model" (layout-independent)
+    let path: String      // absolute local dir holding this model's weight files
+    var id: String { identity }
 }
 
 // MARK: - Model store sync tab
 
 /// Surveys a local model store, lists the models present, and pushes selected
 /// ones to the connected peer's matching store over Thunderbolt (16-stream
-/// rsync). Optionally retargets the destination store (.exo / .mtplx /
-/// .mlxstudio) so weights downloaded once can be fanned out to every runtime.
+/// rsync). Layout-aware: retargeting the destination store (.exo / .mtplx /
+/// .lmstudio) reconstructs each model into that store's on-disk shape (flat
+/// `org--model/` ⇄ nested `org/model/`), so weights downloaded once can be
+/// fanned out to every runtime regardless of how it lays models out.
 struct ModelStoreTab: View {
     @Environment(AppState.self) private var app
 
@@ -166,12 +198,12 @@ struct ModelStoreTab: View {
                     LazyVStack(spacing: 0) {
                         ForEach(models) { model in
                             ModelRow(
-                                name: model.name,
-                                size: sizes[model.name],
-                                isSelected: selection.contains(model.name)
+                                identity: model.identity,
+                                size: sizes[model.identity],
+                                isSelected: selection.contains(model.identity)
                             )
                             .contentShape(Rectangle())
-                            .onTapGesture { toggle(model.name) }
+                            .onTapGesture { toggle(model.identity) }
                             Divider().padding(.leading, 12)
                         }
                     }
@@ -188,7 +220,7 @@ struct ModelStoreTab: View {
                 .foregroundStyle(.secondary)
             Spacer()
             Button(selection.count == models.count ? "Deselect All" : "Select All") {
-                selection = selection.count == models.count ? [] : Set(models.map(\.name))
+                selection = selection.count == models.count ? [] : Set(models.map(\.identity))
             }
             .font(.caption)
             .buttonStyle(.borderless)
@@ -271,7 +303,7 @@ struct ModelStoreTab: View {
         guard exists else { scanning = false; return }
         scanning = true
         Task {
-            let entries = await Self.listModels(in: url)
+            let entries = await Self.listModels(in: url, layout: store.layout)
             await MainActor.run {
                 guard store == sourceStore else { return }  // store-switch race guard
                 models = entries
@@ -281,7 +313,7 @@ struct ModelStoreTab: View {
                 let kb = await Self.dirSizeKB(entry.path)
                 await MainActor.run {
                     guard store == sourceStore else { return }
-                    sizes[entry.name] = kb
+                    sizes[entry.identity] = kb
                 }
             }
         }
@@ -295,10 +327,18 @@ struct ModelStoreTab: View {
         // copies a directory source's CONTENTS into the destination, so the
         // destination must be the per-model folder (mkdir -p'd by the push
         // pre-flight). Batching into one task can't do per-source destinations.
+        //
+        // PACKAGER: the source path is wherever the model's files actually live
+        // in the SOURCE store (flat or nested), and the destination subpath is
+        // rebuilt for the DESTINATION store's layout via `dst.subpath(for:)`.
+        // So a flat EXO `org--model` sent to LM Studio lands at nested
+        // `org/model/`, and a nested LM Studio `org/model` sent to EXO lands at
+        // flat `org--model/` — the engine's `mkdir -p` makes the nested pair.
         var ids: [UUID] = []
-        for name in selection.sorted() {
-            let sourcePath = src.localURL.appendingPathComponent(name).path
-            let destPath = "~/\(dst.relativePath)/\(name)"
+        for identity in selection.sorted() {
+            guard let entry = models.first(where: { $0.identity == identity }) else { continue }
+            let sourcePath = entry.path
+            let destPath = "~/\(dst.relativePath)/\(dst.subpath(for: identity))"
             let task = TransferTask(
                 peerID: peer.id,
                 direction: .push,
@@ -317,32 +357,60 @@ struct ModelStoreTab: View {
         selection = []
     }
 
-    // MARK: - Scanning helpers (off the main actor)
+    // MARK: - Scanning helpers / parser (off the main actor)
 
-    /// List model directories in `storeURL`. A "model" is any non-hidden
-    /// subdirectory that actually holds weights — a `config.json`, a
-    /// `*.safetensors` (or its index), or a `*.gguf`. Filters out caches and
-    /// stray non-model folders so the list is just loadable models.
-    nonisolated private static func listModels(in storeURL: URL) async -> [ModelEntry] {
+    /// **Parser.** Survey `storeURL` and normalize every model to its canonical
+    /// `org/model` identity regardless of the store's on-disk shape:
+    /// - `flat`:   each `org--model/` dir is one model (identity = first `--`→`/`).
+    /// - `nested`: each `publisher/repo/` dir pair is one model (identity =
+    ///   `publisher/repo`); tolerates a rare publisher dir that holds weights
+    ///   directly. A "model" must actually hold weights (config.json /
+    ///   `*.safetensors` / index / `*.gguf`), so caches and stray folders drop.
+    nonisolated private static func listModels(
+        in storeURL: URL, layout: ModelStore.Layout
+    ) async -> [ModelEntry] {
         await Task.detached(priority: .userInitiated) {
-            let fm = FileManager.default
-            guard let kids = try? fm.contentsOfDirectory(
-                at: storeURL,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            ) else { return [] }
+            let skip: Set<String> = ["caches", "cache", "outputs", ".cache"]
             var out: [ModelEntry] = []
-            for url in kids {
-                let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-                guard isDir else { continue }
-                let name = url.lastPathComponent
-                if name == "caches" || name == "cache" { continue }
-                if looksLikeModel(url) {
-                    out.append(ModelEntry(name: name, path: url.path))
+            switch layout {
+            case .flat:
+                for dir in subdirectories(of: storeURL) where !skip.contains(dir.lastPathComponent) {
+                    guard looksLikeModel(dir) else { continue }
+                    out.append(ModelEntry(identity: identity(fromFlatName: dir.lastPathComponent),
+                                          path: dir.path))
+                }
+            case .nested:
+                for pub in subdirectories(of: storeURL) where !skip.contains(pub.lastPathComponent) {
+                    // A publisher dir holding weights directly is an edge case;
+                    // normally we descend one level to `publisher/repo`.
+                    if looksLikeModel(pub) {
+                        out.append(ModelEntry(identity: pub.lastPathComponent, path: pub.path))
+                        continue
+                    }
+                    for repo in subdirectories(of: pub) where looksLikeModel(repo) {
+                        out.append(ModelEntry(identity: "\(pub.lastPathComponent)/\(repo.lastPathComponent)",
+                                              path: repo.path))
+                    }
                 }
             }
-            return out.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            return out.sorted { $0.identity.localizedCaseInsensitiveCompare($1.identity) == .orderedAscending }
         }.value
+    }
+
+    /// `org--model` → `org/model`. Splits on the FIRST `--` only: HF org names
+    /// never contain `--`, and a model name keeping its single dashes (and any
+    /// rare embedded `--`) stays intact on the right side.
+    nonisolated private static func identity(fromFlatName name: String) -> String {
+        guard let r = name.range(of: "--") else { return name }
+        return String(name[..<r.lowerBound]) + "/" + String(name[r.upperBound...])
+    }
+
+    nonisolated private static func subdirectories(of url: URL) -> [URL] {
+        let fm = FileManager.default
+        guard let kids = try? fm.contentsOfDirectory(
+            at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
+        ) else { return [] }
+        return kids.filter { ((try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false) }
     }
 
     nonisolated private static func looksLikeModel(_ dir: URL) -> Bool {
@@ -376,7 +444,7 @@ struct ModelStoreTab: View {
 // MARK: - Model row
 
 private struct ModelRow: View {
-    let name: String
+    let identity: String   // canonical "org/model" (already display-ready)
     let size: Int64?
     let isSelected: Bool
 
@@ -387,11 +455,11 @@ private struct ModelRow: View {
                 .font(.system(size: 15))
             Image(systemName: "cube.fill")
                 .foregroundStyle(.secondary)
-            Text(displayName)
+            Text(identity)
                 .font(.callout)
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .help(name)
+                .help(identity)
             Spacer()
             if let size, size > 0 {
                 Text(sizeString(size))
@@ -404,12 +472,6 @@ private struct ModelRow: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
         .background(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
-    }
-
-    /// Render the flattened `org--model` store name back as `org/model` for
-    /// readability — that's how the cluster (HF ids, Skulk cards) refers to it.
-    private var displayName: String {
-        name.replacingOccurrences(of: "--", with: "/")
     }
 
     private func sizeString(_ bytes: Int64) -> String {
