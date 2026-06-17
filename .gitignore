@@ -1,0 +1,15 @@
+# Build artifacts
+.build/
+.swiftpm/
+*.dmg
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Backups
+*.bak
+*.bak-*
