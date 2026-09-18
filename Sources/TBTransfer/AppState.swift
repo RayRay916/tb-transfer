@@ -9,6 +9,7 @@ import Network
 @MainActor
 final class AppState {
     let interfaceMonitor = TBInterfaceMonitor()
+    let peerAdvertiser = TBPeerAdvertiser()
     let peerStore = PeerStore()
     let transferEngine = TransferEngine()
     let transferHistory = TransferHistory()
@@ -318,6 +319,16 @@ final class AppState {
         // peer whose IP hasn't churned is re-found instantly and reliably.
         let hintIPs = peerStore.peers.compactMap { $0.lastSeenIP }.filter { !$0.isEmpty }
         await interfaceMonitor.refresh(hintIPs: hintIPs)
+        // Announce ourselves with the addresses we just resolved, so a peer does
+        // not have to guess our Thunderbolt IPv4 from an A record mDNS may not
+        // publish on that link.
+        let advertised = Dictionary(
+            uniqueKeysWithValues: interfaceMonitor.interfaces.compactMap { iface -> (String, String)? in
+                guard iface.isUsable, let ip = iface.localIP else { return nil }
+                return (iface.name, ip)
+            }
+        )
+        peerAdvertiser.publish(interfaceAddresses: advertised)
         // Batch reconcile: groups all discovered paths by physical machine and
         // picks ONE stable path per machine, so a peer reachable over two ports
         // (or mid-cable-move with a stale ARP entry on the old port) doesn't

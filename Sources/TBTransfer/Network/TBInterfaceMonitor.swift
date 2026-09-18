@@ -211,73 +211,73 @@ final class TBInterfaceMonitor {
         }
     }
 
-    /// Discover peers over Thunderbolt using Bonjour + the resolver instead of
-    /// the (macOS 27-hidden) ARP table. Returns one path per
-    /// (interface, peer host) pair so a machine on two ports still reconciles as
-    /// one machine via `discoveryIdentityKey`.
+    /// Discover peers over Thunderbolt from their Bonjour advertisements instead
+    /// of the (macOS 27-hidden) ARP table. A TBTransfer peer states its own
+    /// per-port IPv4s in the TXT record, so it is found even when its responder
+    /// publishes no A record for the link; foreign service types (`_ssh`, `_rfb`)
+    /// still resolve through per-interface address records.
+    ///
+    /// Returns one path per (interface, peer host) pair so a machine on two ports
+    /// still reconciles as one machine via `discoveryIdentityKey`.
     private func discoverViaHostnames(
         active: [TBInterface],
         ownIPs: Set<String>
     ) async -> [DiscoveredPeer] {
-        let tbInterfaces = Set(active.map(\.name))
-        let indexByInterface = Dictionary(
-            uniqueKeysWithValues: active.compactMap { iface -> (Int, String)? in
-                let idx = Int(if_nametoindex(iface.name))
-                return idx == 0 ? nil : (idx, iface.name)
-            }
-        )
-        guard !indexByInterface.isEmpty else { return [] }
+        guard !active.isEmpty else { return [] }
 
-        let advertised = await TBHostPeerBrowser.browseInstances()
-        var unique: [TBHostPeerBrowser.DNSSDInstance] = []
-        var seenInstances = Set<TBHostPeerBrowser.DNSSDInstance>()
-        for service in advertised where seenInstances.insert(service).inserted {
-            unique.append(service)
-        }
-        guard !unique.isEmpty else { return [] }
-
-        // Ask each advertised service where it actually lives.
         let selfHost = normalizeHostname(TBHostPeerBrowser.selfHostName()) ?? ""
-        var hostsByIndex: [String: Set<Int>] = [:]     // .local host → interface indexes seen on
-        await withTaskGroup(of: (TBHostPeerBrowser.ServiceTarget?, Int).self) { group in
-            for service in unique {
-                group.addTask {
-                    let target = await TBHostPeerBrowser.lookupTarget(
-                        instance: service.instance,
-                        type: service.serviceType
-                    )
-                    return (target, service.interfaceIndex)
-                }
+        let ownInstance = normalizeHostname(TBHostPeerBrowser.localHostNameInstance()) ?? ""
+        var byHost: [String: (serviceType: String, txt: [String: String])] = [:]
+        for advertisement in await TBHostPeerBrowser.advertisements() {
+            // Our own service type names the machine in its instance; the SRV
+            // target is a random UUID NetService invents, so it cannot be used as
+            // identity. Foreign types (`_ssh`, `_rfb`) carry the real host there.
+            let isOurs = advertisement.isFromTBTransfer
+            let host = isOurs
+                ? TBHostPeerBrowser.localHostName(fromInstance: advertisement.instance)
+                : advertisement.targetHost
+            let normalized = normalizeHostname(host) ?? ""
+            guard !normalized.isEmpty else { continue }
+            guard normalized != selfHost, normalized != ownInstance else { continue }
+
+            let declared = TBPeerTXT.peerInterfaceAddresses(advertisement.txt)
+            if isOurs {
+                // A machine advertising its own addresses back at us is us.
+                guard !declared.isEmpty, !declared.values.allSatisfy({ ownIPs.contains($0) }) else { continue }
             }
-            for await (target, browseIndex) in group {
-                guard let target else { continue }
-                let normalized = normalizeHostname(target.host) ?? ""
-                guard !normalized.isEmpty, normalized != selfHost else { continue }
-                // Trust the index from the answer itself; fall back to the index
-                // the browse row arrived on when it is absent.
-                hostsByIndex[target.host, default: []].insert(
-                    target.interfaceIndex != 0 ? target.interfaceIndex : browseIndex
-                )
-            }
+            // Prefer our own type: it is the only one carrying TB addresses.
+            if let existing = byHost[normalized], existing.txt["tbv"] != nil, !isOurs { continue }
+            byHost[normalized] = (advertisement.serviceType, advertisement.txt)
         }
-        guard !hostsByIndex.isEmpty else { return [] }
+        guard !byHost.isEmpty else { return [] }
 
         var out: [DiscoveredPeer] = []
         var used = Set<String>()
-        for host in hostsByIndex.keys.sorted() {
-            // Ask mDNS directly, per interface: it answers one row per port the
-            // address is reachable through, which is the attribution the hidden
-            // ARP table used to provide.
-            for resolved in await TBHostPeerBrowser.resolvedAddresses(of: host) {
-                let ip = resolved.ip
-                guard isLinkLocalIPv4(ip), !ownIPs.contains(ip) else { continue }
-                var iface = indexByInterface[resolved.interfaceIndex]
-                if iface == nil {
-                    // Fall back to the kernel route for the (rare) answer that
-                    // arrives without a usable interface index.
-                    iface = await TBHostPeerBrowser.interface(forIP: ip)
+        for host in byHost.keys.sorted() {
+            let record = byHost[host]!
+            var candidates: [(ip: String, iface: String?)] = []
+
+            if record.txt["tbv"] != nil {
+                // A TBTransfer peer: trust the addresses it declared. They are
+                // link-local by construction, and carry no ambiguity about the
+                // family or the port they belong to.
+                for (declaredIface, ip) in TBPeerTXT.peerInterfaceAddresses( record.txt) {
+                    candidates.append((ip, declaredIface))
                 }
-                guard let iface, tbInterfaces.contains(iface) else { continue }
+            } else {
+                for resolved in await TBHostPeerBrowser.resolvedAddresses(of: host) {
+                    candidates.append((resolved.ip, nil))
+                }
+            }
+
+            for candidate in candidates {
+                let ip = candidate.ip
+                guard isLinkLocalIPv4(ip), !ownIPs.contains(ip) else { continue }
+                guard let iface = await resolveThunderboltInterface(
+                    forPeerIP: ip,
+                    declaredInterface: candidate.iface,
+                    active: active
+                ) else { continue }
                 let mac = TBHostPeerBrowser.syntheticMAC(forHost: host)
                 guard used.insert("\(iface)\u{0}\(mac)").inserted else { continue }
                 out.append(DiscoveredPeer(
@@ -289,6 +289,35 @@ final class TBInterfaceMonitor {
             }
         }
         return out
+    }
+
+    /// Which of our Thunderbolt ports reaches `peerIP`.
+    ///
+    /// The kernel route is authoritative when it has a host entry (one is learned
+    /// as soon as the peer answers anything on the link). Before the first reply
+    /// there is no route, so fall back to the peer's own declaration — either the
+    /// interface name from its TXT record, or a /16 match against our link-local
+    /// addresses, which is the best available guess on a two-node cable.
+    private func resolveThunderboltInterface(
+        forPeerIP peerIP: String,
+        declaredInterface: String?,
+        active: [TBInterface]
+    ) async -> String? {
+        if let route = await TBHostPeerBrowser.interface(forIP: peerIP),
+           active.contains(where: { $0.name == route }) {
+            return route
+        }
+        if let declaredInterface, active.contains(where: { $0.name == declaredInterface }) {
+            return declaredInterface
+        }
+        let peerPrefix = String(peerIP.split(separator: ".").prefix(2).joined(separator: "."))
+        if let match = active.first(where: { iface in
+            guard let localIP = iface.localIP else { return false }
+            return String(localIP.split(separator: ".").prefix(2).joined(separator: ".")) == peerPrefix
+        }) {
+            return match.name
+        }
+        return nil
     }
 
     /// One ARP-warming pass: broadcast-ping each active interface's subnet AND
