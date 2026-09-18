@@ -34,5 +34,7 @@
     <string>NSApplication</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.utilities</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>TBTransfer finds the Macs plugged into your Thunderbolt ports and moves files between them, so it needs access to the local network.</string>
 </dict>
 </plist>

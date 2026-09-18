@@ -245,7 +245,7 @@ fileprivate func storageURL() throws -> URL {
     return dir.appendingPathComponent("peers.json")
 }
 
-fileprivate func normalizeHostname(_ raw: String?) -> String? {
+internal func normalizeHostname(_ raw: String?) -> String? {
     guard let raw else { return nil }
     var s = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     while s.hasSuffix(".") {

@@ -108,14 +108,21 @@ final class TBInterfaceMonitor {
         // ping→300ms→read against wake/replug races where the first ARP reply
         // hasn't landed yet. Peers accumulate across attempts (union).
         let active = sortedInterfaces.filter(\.isUsable)
-        let ownMacByInterface: [String: String] = Dictionary(
-            active.map { ($0.name, $0.macAddress) },
-            uniquingKeysWith: { a, _ in a }
-        )
+        // Two identities per interface: `networksetup` reports the burned-in
+        // address, while `ifconfig` sometimes returns a placeholder (macOS 27
+        // intermittently answers `ether 02:00:00:00:00:00`). Filter against both.
+        var ownMacsByInterface: [String: Set<String>] = [:]
+        for port in ports {
+            ownMacsByInterface[port.device, default: []].insert(normalizeMAC(port.mac))
+        }
+        for iface in sortedInterfaces {
+            ownMacsByInterface[iface.name, default: []].insert(iface.macAddress)
+        }
 
         var unionByKey: [String: DiscoveredPeer] = [:]
         let maxAttempts = 3
         let target = max(1, hintIPs.count)
+        var sawAnyArpEntry = false
 
         if !active.isEmpty {
             for attempt in 0..<maxAttempts {
@@ -124,10 +131,11 @@ final class TBInterfaceMonitor {
                 // slow peer's reply to arrive.
                 try? await Task.sleep(for: .milliseconds(250 + attempt * 150))
 
-                let arpOutput = await readGlobalArpTable()
-                for line in parseGlobalArpTable(arpOutput) {
-                    guard let ownMac = ownMacByInterface[line.ifname] else { continue }
-                    if line.mac == ownMac { continue }
+                let arp = await readGlobalArpTable()
+                if arp.entries > 0 { sawAnyArpEntry = true }
+                for line in parseGlobalArpTable(arp.output) {
+                    guard let ownMacs = ownMacsByInterface[line.ifname] else { continue }
+                    if ownMacs.contains(line.mac) { continue }
                     if line.mac == "ff:ff:ff:ff:ff:ff" { continue }
                     if line.mac.hasPrefix("01:00:5e") { continue }
                     if line.mac.hasPrefix("33:33:")   { continue }
@@ -149,6 +157,28 @@ final class TBInterfaceMonitor {
             }
         }
 
+        // Second discovery path: mDNS. Always run when a TB link is up — on
+        // macOS 27 it is often the ONLY path (the ARP table is hidden from app
+        // processes), and on older systems it resolves names the ARP table
+        // leaves as "?". Results carry a hostname, which is the app's primary
+        // peer identity, so they reconcile onto the same registry records.
+        var hostPeers: [DiscoveredPeer] = []
+        if !active.isEmpty {
+            hostPeers = await discoverViaHostnames(
+                active: active,
+                ownIPs: await allLocalIPv4()
+
+            )
+            for peer in hostPeers {
+                let key = "\(peer.interfaceName)\u{0}\(peer.macAddress)"
+                // An ARP row with the same interface+MAC wins: it is the live
+                // hardware address rather than our hostname-derived stand-in.
+                if unionByKey[key] == nil || unionByKey[key]?.hostname == nil {
+                    unionByKey[key] = peer
+                }
+            }
+        }
+
         let peers = Array(unionByKey.values)
 
         // Enrich with reverse DNS — bounded so it can't hang the refresh.
@@ -164,10 +194,101 @@ final class TBInterfaceMonitor {
                 : "Thunderbolt interface(s) present but none active (cable unplugged / peer asleep)."
         } else if enriched.isEmpty {
             let names = active.map(\.name).joined(separator: ", ")
-            self.lastError = "TB link up on \(names) but no peer responded after \(maxAttempts) ARP attempts."
+            if !sawAnyArpEntry {
+                // A healthy ARP table always has entries, so 0 rows means macOS
+                // 27 is filtering it from this process (normal for an app bundle,
+                // and unrelated to the Local Network grant). That is fine as long
+                // as mDNS found somebody; reaching here means both paths were
+                // empty, i.e. there is genuinely no reachable peer on the link.
+                self.lastError =
+                    "TB link up on \(names), but no peer answered ARP (hidden by macOS) or Bonjour. "
+                    + "Is Remote Login enabled on the other Mac?"
+            } else {
+                self.lastError = "TB link up on \(names) but no peer responded after \(maxAttempts) ARP attempts."
+            }
         } else {
             self.lastError = nil
         }
+    }
+
+    /// Discover peers over Thunderbolt using Bonjour + the resolver instead of
+    /// the (macOS 27-hidden) ARP table. Returns one path per
+    /// (interface, peer host) pair so a machine on two ports still reconciles as
+    /// one machine via `discoveryIdentityKey`.
+    private func discoverViaHostnames(
+        active: [TBInterface],
+        ownIPs: Set<String>
+    ) async -> [DiscoveredPeer] {
+        let tbInterfaces = Set(active.map(\.name))
+        let indexByInterface = Dictionary(
+            uniqueKeysWithValues: active.compactMap { iface -> (Int, String)? in
+                let idx = Int(if_nametoindex(iface.name))
+                return idx == 0 ? nil : (idx, iface.name)
+            }
+        )
+        guard !indexByInterface.isEmpty else { return [] }
+
+        let advertised = await TBHostPeerBrowser.browseInstances()
+        var unique: [TBHostPeerBrowser.DNSSDInstance] = []
+        var seenInstances = Set<TBHostPeerBrowser.DNSSDInstance>()
+        for service in advertised where seenInstances.insert(service).inserted {
+            unique.append(service)
+        }
+        guard !unique.isEmpty else { return [] }
+
+        // Ask each advertised service where it actually lives.
+        let selfHost = normalizeHostname(TBHostPeerBrowser.selfHostName()) ?? ""
+        var hostsByIndex: [String: Set<Int>] = [:]     // .local host → interface indexes seen on
+        await withTaskGroup(of: (TBHostPeerBrowser.ServiceTarget?, Int).self) { group in
+            for service in unique {
+                group.addTask {
+                    let target = await TBHostPeerBrowser.lookupTarget(
+                        instance: service.instance,
+                        type: service.serviceType
+                    )
+                    return (target, service.interfaceIndex)
+                }
+            }
+            for await (target, browseIndex) in group {
+                guard let target else { continue }
+                let normalized = normalizeHostname(target.host) ?? ""
+                guard !normalized.isEmpty, normalized != selfHost else { continue }
+                // Trust the index from the answer itself; fall back to the index
+                // the browse row arrived on when it is absent.
+                hostsByIndex[target.host, default: []].insert(
+                    target.interfaceIndex != 0 ? target.interfaceIndex : browseIndex
+                )
+            }
+        }
+        guard !hostsByIndex.isEmpty else { return [] }
+
+        var out: [DiscoveredPeer] = []
+        var used = Set<String>()
+        for host in hostsByIndex.keys.sorted() {
+            // Ask mDNS directly, per interface: it answers one row per port the
+            // address is reachable through, which is the attribution the hidden
+            // ARP table used to provide.
+            for resolved in await TBHostPeerBrowser.resolvedAddresses(of: host) {
+                let ip = resolved.ip
+                guard isLinkLocalIPv4(ip), !ownIPs.contains(ip) else { continue }
+                var iface = indexByInterface[resolved.interfaceIndex]
+                if iface == nil {
+                    // Fall back to the kernel route for the (rare) answer that
+                    // arrives without a usable interface index.
+                    iface = await TBHostPeerBrowser.interface(forIP: ip)
+                }
+                guard let iface, tbInterfaces.contains(iface) else { continue }
+                let mac = TBHostPeerBrowser.syntheticMAC(forHost: host)
+                guard used.insert("\(iface)\u{0}\(mac)").inserted else { continue }
+                out.append(DiscoveredPeer(
+                    interfaceName: iface,
+                    ipAddress: ip,
+                    macAddress: mac,
+                    hostname: host
+                ))
+            }
+        }
+        return out
     }
 
     /// One ARP-warming pass: broadcast-ping each active interface's subnet AND
@@ -203,7 +324,7 @@ final class TBInterfaceMonitor {
 
 // MARK: - Global ARP table read + parse
 
-private func readGlobalArpTable() async -> String {
+private func readGlobalArpTable() async -> (output: String, entries: Int) {
     // CRITICAL: `arp -a` (without -n) does synchronous reverse DNS for each entry.
     // Uncached link-local mDNS lookups can take 5-30s and DO NOT respond to SIGTERM
     // from Process timeout, hanging the whole discovery flow. Always pass `-n`.
@@ -214,13 +335,13 @@ private func readGlobalArpTable() async -> String {
             ["-an"],
             timeout: 3
         ), !result.stdout.isEmpty {
-            return result.stdout
+            return (result.stdout, result.stdout.split(separator: "\n").count)
         }
         if attempt < 2 {
             try? await Task.sleep(for: .milliseconds(200))
         }
     }
-    return ""
+    return ("", 0)
 }
 
 /// Best-effort reverse DNS for each peer IP. Bounded total time via a TaskGroup
@@ -492,6 +613,34 @@ internal func parseArpTable(
     return rows
 }
 
+/// True for the RFC 3927 link-local range — the space a Thunderbolt bridge
+/// self-assigns from when neither side has a static address.
+func isLinkLocalIPv4(_ ip: String) -> Bool {
+    guard isIPv4Address(ip) else { return false }
+    return ip.hasPrefix("169.254.")
+}
+
+/// Every IPv4 currently bound on this machine, so discovery can tell our own
+/// address (seen through a shared or virtual interface) apart from a peer's.
+func allLocalIPv4() async -> Set<String> {
+    guard let result = try? await ShellRunner.run("/sbin/ifconfig", [], timeout: 3) else { return [] }
+    return parseLocalIPv4Addresses(result.stdout)
+}
+
+/// Parse `ifconfig` (no arguments) output into every IPv4 bound on this machine.
+func parseLocalIPv4Addresses(_ output: String) -> Set<String> {
+    var out: Set<String> = []
+    for rawLine in output.split(separator: "\n") {
+        let line = rawLine.trimmingCharacters(in: .whitespaces)
+        guard line.hasPrefix("inet ") else { continue }
+        let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 2 else { continue }
+        let ip = String(parts[1])
+        if isIPv4Address(ip) { out.insert(ip) }
+    }
+    return out
+}
+
 /// Normalize a MAC address to lowercase + zero-padded octets.
 /// Example: `36:c3:e8:89:79:8` → `36:c3:e8:89:79:08`.
 /// Inputs that don't look like a MAC are returned lowercased unchanged.
@@ -513,4 +662,8 @@ internal func normalizeMAC(_ raw: String) -> String {
 fileprivate func stripPrefix(_ line: String, _ prefix: String) -> String? {
     guard line.hasPrefix(prefix) else { return nil }
     return String(line.dropFirst(prefix.count))
+}
+
+internal func optionalStrip(_ line: String, _ prefix: String) -> String? {
+    stripPrefix(line, prefix)
 }
