@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 /// Advertises this Mac to other TBTransfer instances over Bonjour.
 ///

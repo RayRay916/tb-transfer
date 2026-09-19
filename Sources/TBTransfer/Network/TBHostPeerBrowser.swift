@@ -15,6 +15,15 @@ import Network
 /// `dscacheutil`, keep the link-local (RFC 3927 — what a Thunderbolt bridge
 /// uses) addresses that are not ours, and attribute each one to a port with
 /// `route -n get`.
+// Browse with NWBrowser (peer-to-peer), NOT `dns-sd -B`: measured on 27.0, NWBrowser
+// enumerated ms2 across the cable while `dns-sd -B` listed only the LAN interfaces and
+// missed ms2 entirely. Publishing is done with NetService in TBPeerAdvertiser, whose
+// advertisement (unlike NWListener's) also reaches the Thunderbolt interfaces.
+//
+// The TXT record of our own service type carries each peer's Thunderbolt IPv4s, so a
+// link that publishes no A record is still usable; foreign service types
+// (`_ssh._tcp`, `_rfb._tcp`) are the fallback for peers on a pre-advertisement build
+// and resolve through per-interface address records.
 enum TBHostPeerBrowser {
     /// Bonjour instance names are a display string, while the resolvable host is
     /// `<LocalHostName>.local` — the lowercased computer name with non
@@ -110,6 +119,63 @@ enum TBHostPeerBrowser {
     private static func zoneValue(_ line: Substring) -> String {
         line.split(separator: " ", omittingEmptySubsequences: true).dropFirst(2)
             .joined(separator: " ")
+    }
+
+    /// Enumerate advertised instances with NWBrowser (peer-to-peer on), then read
+    /// each one's TXT with `dns-sd -Z`. NWBrowser sees peers on the Thunderbolt
+    /// links that `dns-sd -B` omits, while `-Z` is the only way to get TXT here —
+    /// NWBrowser's endpoint carries the instance name, not its records.
+    static func browsePeerToPeer(
+        types: [String] = browseTypes,
+        dwell: TimeInterval = 2.5
+    ) async -> [Advertisement] {
+        let pairs = await withTaskGroup(of: [(String, String)].self) { group in
+            for type in types {
+                group.addTask { await browseInstances(of: type, dwell: dwell) }
+            }
+            var all: [(String, String)] = []
+            for await part in group { all.append(contentsOf: part) }
+            return all
+        }
+
+        var out: [Advertisement] = []
+        var unique = Set<String>()
+        await withTaskGroup(of: [Advertisement].self) { group in
+            for (instance, type) in pairs where unique.insert("\(type)\u{0}\(instance)").inserted {
+                group.addTask { await self.zoneForInstance(instance: instance, type: type) }
+            }
+            for await part in group { out.append(contentsOf: part) }
+        }
+        return out
+    }
+
+    /// Instance names of one service type, via NWBrowser.
+    static func browseInstances(of type: String, dwell: TimeInterval) async -> [(instance: String, type: String)] {
+        let params = NWParameters.tcp
+        params.includePeerToPeer = true
+        let box = BrowseBox()
+        let browser = NWBrowser(for: .bonjour(type: type, domain: "local"), using: params)
+        browser.browseResultsChangedHandler = { results, _ in
+            var found: [(String, String)] = []
+            for r in results {
+                if case .service(let name, let t, _, _) = r.endpoint {
+                    found.append((unescapeDNSSD(name), t.replacingOccurrences(of: ".", with: "")))
+                }
+            }
+            box.replace(found)
+        }
+        browser.start(queue: DispatchQueue.global(qos: .userInitiated))
+        try? await Task.sleep(for: .seconds(dwell))
+        browser.cancel()
+        return box.value()
+    }
+
+    /// Full records for one instance (SRV target + TXT).
+    static func zoneForInstance(instance: String, type: String) async -> [Advertisement] {
+        guard let result = try? await ShellRunner.run(
+            "/usr/bin/dns-sd", ["-Z", type, "local"], timeout: 4
+        ) else { return [] }
+        return parseZoneOutput(result.stdout, type: type).filter { $0.instance == instance }
     }
 
     /// Parse `dns-sd -Z <type> local` output into advertisements:
@@ -300,3 +366,20 @@ enum TBHostPeerBrowser {
         )
     }
 }
+
+/// Lock-protected accumulator: `NWBrowser`'s result callback is synchronous and
+/// fires on its own queue, so an actor cannot be used from inside it.
+final class BrowseBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [(instance: String, type: String)] = []
+    func replace(_ new: [(instance: String, type: String)]) {
+        lock.lock(); defer { lock.unlock() }
+        items = new
+    }
+    func value() -> [(instance: String, type: String)] {
+        lock.lock(); defer { lock.unlock() }
+        return items
+    }
+}
+
+/// Minimal SHA-256 helpers live in `SHA256Digest`.

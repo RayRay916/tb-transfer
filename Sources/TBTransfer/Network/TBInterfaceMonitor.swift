@@ -228,7 +228,7 @@ final class TBInterfaceMonitor {
         let selfHost = normalizeHostname(TBHostPeerBrowser.selfHostName()) ?? ""
         let ownInstance = normalizeHostname(TBHostPeerBrowser.localHostNameInstance()) ?? ""
         var byHost: [String: (serviceType: String, txt: [String: String])] = [:]
-        for advertisement in await TBHostPeerBrowser.advertisements() {
+        for advertisement in await TBHostPeerBrowser.browsePeerToPeer() {
             // Our own service type names the machine in its instance; the SRV
             // target is a random UUID NetService invents, so it cannot be used as
             // identity. Foreign types (`_ssh`, `_rfb`) carry the real host there.
