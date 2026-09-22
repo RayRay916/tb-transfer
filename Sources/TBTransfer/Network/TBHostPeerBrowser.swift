@@ -158,8 +158,13 @@ enum TBHostPeerBrowser {
         browser.browseResultsChangedHandler = { results, _ in
             var found: [(String, String)] = []
             for r in results {
-                if case .service(let name, let t, _, _) = r.endpoint {
-                    found.append((unescapeDNSSD(name), t.replacingOccurrences(of: ".", with: "")))
+                if case .service(let name, _, _, _) = r.endpoint {
+                    // Report the canonical type we browsed for, not the endpoint's:
+                    // NWBrowser prints it as `_tbtransfer._tcp.` and every naive
+                    // dot-strip mangles it into `_tbtransfer_tcp`, which `dns-sd -Z`
+                    // then queries as a nonexistent service type — silently zero
+                    // records, i.e. no peers.
+                    found.append((unescapeDNSSD(name), type))
                 }
             }
             box.replace(found)
