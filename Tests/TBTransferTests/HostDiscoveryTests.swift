@@ -239,4 +239,49 @@ final class HostDiscoveryTests: XCTestCase {
             "MacBook Pro (2)"
         )
     }
+
+    // MARK: - Port attribution of a peer's declared addresses
+
+    private let ports = [
+        TBInterface(name: "en3", hardwareName: "Thunderbolt 1", macAddress: "02:00:00:00:00:03",
+                    localIP: "169.254.81.154", status: .active),
+        TBInterface(name: "en5", hardwareName: "Thunderbolt 2", macAddress: "02:00:00:00:00:05",
+                    localIP: "169.254.191.238", status: .active),
+    ]
+
+    func testAttribute_dropsAddressNoPortReaches() {
+        // Live 27.0 triangle: mbp2 declares en1=169.254.44.67 (our cable) and
+        // en2=169.254.29.214 (its cable to the OTHER MacBook). The kernel routes
+        // the second out en0 and no Thunderbolt port gets a ping reply. It is
+        // link-local and the peer declared a port for it, yet it must be
+        // rejected — storing it made every probe and pairing to mbp2 fail.
+        XCTAssertNil(attributeThunderboltInterface(
+            routeInterface: "en0", answeringInterfaces: [], active: ports
+        ))
+        XCTAssertNil(attributeThunderboltInterface(
+            routeInterface: nil, answeringInterfaces: [], active: ports
+        ))
+    }
+
+    func testAttribute_trustsHostRouteOnActivePort() {
+        XCTAssertEqual(attributeThunderboltInterface(
+            routeInterface: "en5", answeringInterfaces: [], active: ports
+        ), "en5")
+    }
+
+    func testAttribute_fallsBackToPortThatAnsweredPing() {
+        XCTAssertEqual(attributeThunderboltInterface(
+            routeInterface: "en0", answeringInterfaces: ["en3"], active: ports
+        ), "en3")
+        // Two answering ports (two cables to one peer): lowest name, deterministic.
+        XCTAssertEqual(attributeThunderboltInterface(
+            routeInterface: nil, answeringInterfaces: ["en5", "en3"], active: ports
+        ), "en3")
+    }
+
+    func testAttribute_ignoresAnswersFromInactivePorts() {
+        XCTAssertNil(attributeThunderboltInterface(
+            routeInterface: "en0", answeringInterfaces: ["en0", "en17"], active: ports
+        ))
+    }
 }

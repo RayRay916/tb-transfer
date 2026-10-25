@@ -255,29 +255,21 @@ final class TBInterfaceMonitor {
         var used = Set<String>()
         for host in byHost.keys.sorted() {
             let record = byHost[host]!
-            var candidates: [(ip: String, iface: String?)] = []
+            var candidates: [String] = []
 
             if record.txt["tbv"] != nil {
-                // A TBTransfer peer: trust the addresses it declared. They are
-                // link-local by construction, and carry no ambiguity about the
-                // family or the port they belong to.
-                for (declaredIface, ip) in TBPeerTXT.peerInterfaceAddresses( record.txt) {
-                    candidates.append((ip, declaredIface))
-                }
+                // A TBTransfer peer declares EVERY Thunderbolt address it has,
+                // including a port cabled to some other Mac. Which of them we
+                // can reach is settled per port below; sorted so the outcome
+                // does not follow dictionary order from pass to pass.
+                candidates = TBPeerTXT.peerInterfaceAddresses(record.txt).values.sorted()
             } else {
-                for resolved in await TBHostPeerBrowser.resolvedAddresses(of: host) {
-                    candidates.append((resolved.ip, nil))
-                }
+                candidates = await TBHostPeerBrowser.resolvedAddresses(of: host).map(\.ip).sorted()
             }
 
-            for candidate in candidates {
-                let ip = candidate.ip
+            for ip in candidates {
                 guard isLinkLocalIPv4(ip), !ownIPs.contains(ip) else { continue }
-                guard let iface = await resolveThunderboltInterface(
-                    forPeerIP: ip,
-                    declaredInterface: candidate.iface,
-                    active: active
-                ) else { continue }
+                guard let iface = await resolveThunderboltInterface(forPeerIP: ip, active: active) else { continue }
                 let mac = TBHostPeerBrowser.syntheticMAC(forHost: host)
                 guard used.insert("\(iface)\u{0}\(mac)").inserted else { continue }
                 out.append(DiscoveredPeer(
@@ -291,33 +283,43 @@ final class TBInterfaceMonitor {
         return out
     }
 
-    /// Which of our Thunderbolt ports reaches `peerIP`.
+    /// Which of our Thunderbolt ports reaches `peerIP`, or nil when none does.
     ///
     /// The kernel route is authoritative when it has a host entry (one is learned
     /// as soon as the peer answers anything on the link). Before the first reply
-    /// there is no route, so fall back to the peer's own declaration — either the
-    /// interface name from its TXT record, or a /16 match against our link-local
-    /// addresses, which is the best available guess on a two-node cable.
-    private func resolveThunderboltInterface(
-        forPeerIP peerIP: String,
-        declaredInterface: String?,
-        active: [TBInterface]
-    ) async -> String? {
-        if let route = await TBHostPeerBrowser.interface(forIP: peerIP),
-           active.contains(where: { $0.name == route }) {
-            return route
+    /// there is no route, so ask each port directly: a ping bound to a port is
+    /// only answered by the machine on that cable. An address the peer declared
+    /// for a port cabled to a *different* Mac answers on none of ours and is
+    /// dropped. The old /16 guess pinned it to our first port instead, which
+    /// stored an unreachable IP for the peer and broke every probe and pairing.
+    private func resolveThunderboltInterface(forPeerIP peerIP: String, active: [TBInterface]) async -> String? {
+        let route = await TBHostPeerBrowser.interface(forIP: peerIP)
+        if let hit = attributeThunderboltInterface(routeInterface: route, answeringInterfaces: [], active: active) {
+            return hit
         }
-        if let declaredInterface, active.contains(where: { $0.name == declaredInterface }) {
-            return declaredInterface
+        let answering = await portsAnsweringPing(ip: peerIP, ports: active.map(\.name))
+        return attributeThunderboltInterface(routeInterface: nil, answeringInterfaces: answering, active: active)
+    }
+
+    /// Ping `ip` once from every port concurrently. `-b` binds the socket to the
+    /// port — an unbound ping to a link-local address with no host route leaves
+    /// through the LAN interface and proves nothing about the cable.
+    private func portsAnsweringPing(ip: String, ports: [String]) async -> Set<String> {
+        await withTaskGroup(of: String?.self) { group in
+            for port in ports {
+                group.addTask {
+                    let result = try? await ShellRunner.run(
+                        "/sbin/ping", ["-c", "1", "-t", "1", "-b", port, ip], timeout: 2
+                    )
+                    return result?.ok == true ? port : nil
+                }
+            }
+            var out = Set<String>()
+            for await port in group {
+                if let port { out.insert(port) }
+            }
+            return out
         }
-        let peerPrefix = String(peerIP.split(separator: ".").prefix(2).joined(separator: "."))
-        if let match = active.first(where: { iface in
-            guard let localIP = iface.localIP else { return false }
-            return String(localIP.split(separator: ".").prefix(2).joined(separator: ".")) == peerPrefix
-        }) {
-            return match.name
-        }
-        return nil
     }
 
     /// One ARP-warming pass: broadcast-ping each active interface's subnet AND
@@ -640,6 +642,22 @@ internal func parseArpTable(
     }
 
     return rows
+}
+
+/// Attribute a peer address to one of our Thunderbolt ports from evidence of a
+/// reply only: the kernel host route when it names an active port, otherwise the
+/// lowest-named active port that answered a bound ping. Never guesses from the
+/// address prefix or from the peer's own interface names, so an address no port
+/// reaches yields nil and is never stored as the peer's IP.
+internal func attributeThunderboltInterface(
+    routeInterface: String?,
+    answeringInterfaces: Set<String>,
+    active: [TBInterface]
+) -> String? {
+    if let routeInterface, active.contains(where: { $0.name == routeInterface }) {
+        return routeInterface
+    }
+    return active.map(\.name).filter(answeringInterfaces.contains).sorted().first
 }
 
 /// True for the RFC 3927 link-local range — the space a Thunderbolt bridge
